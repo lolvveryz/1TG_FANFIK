@@ -163,7 +163,7 @@ async def save_message(db: aiosqlite.Connection, chat_id: int, message_id: int, 
     await db.commit()
 
 
-@dp.message(Command("start_story"))
+@dp.message(Command(commands=["start_story", "start_story@tgTeller_bot "], ignore_mention=True))
 async def handle_start(message: Message, bot: Bot):
     if bot.id != bot1.id:
         return
@@ -192,6 +192,19 @@ async def handle_start(message: Message, bot: Bot):
     await save_message(chat_id, dorian_msg.message_id, f"bot_{bot2.id}", dorian_msg.text)
     
     await save_fact(chat_id, "Новенька в Академії, завтра перший день")
+
+@dp.message(Command("reset", ignore_mention=True))
+async def reset_game(message: Message):
+    chat_id = message.chat.id
+    async with aiosqlite.connect("chat_history.db") as db:
+        # Видаляємо всі повідомлення, факти та статус глави для цього чату
+        await db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+        await db.execute("DELETE FROM memories WHERE chat_id = ?", (chat_id,))
+        await db.execute("DELETE FROM chat_states WHERE chat_id = ?", (chat_id,))
+        await db.commit()
+        
+    await message.answer("🔄 Системне повідомлення: Вашу пам'ять та прогрес повністю стерто. Введіть /start_story, щоб почати нову гру.")
+    print(f"[{chat_id}] ПРОГРЕС СКИДАННЯ")
 
 # 3. Оновлюємо хендлер: додаємо параметр bot: Bot
 @dp.message()
@@ -261,11 +274,11 @@ async def handle_message(message: Message, bot: Bot):
                         "Дякуємо, що зіграли в перший епізод 'Академії Святого Юди'. "
                         "Попереду ще багато таємниць. Введіть /reset, щоб спробувати інші варіанти діалогів!"
                     )
-                    await bot1.send_message(chat_id, end_text)
+                    await teller.send_message(chat_id, end_text)
                     # Можна також заблокувати подальші відповіді ботів, але для демо вистачить і цього.
-        else:
-            await bot1.send_message(chat_id, "*(Зв'язок з Академією тимчасово перервано. Спробуйте ще раз.)*")
-            return
+        # else:
+        #     await teller.send_message(chat_id, "*(Зв'язок з Академією тимчасово перервано. Спробуйте ще раз.)*")
+        #     return
 
 async def main():
     await init_db()
