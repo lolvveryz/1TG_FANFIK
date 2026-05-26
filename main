@@ -1,0 +1,288 @@
+import asyncio, os
+from google import genai
+import aiosqlite
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher
+from aiogram.types import Message
+import json
+from pydantic import BaseModel
+from typing import List
+from desc import CHARACTERS, STORY_STAGES
+
+load_dotenv()
+teller = Bot(token=os.getenv("BOT0"))
+bot1 = Bot(token=os.getenv("BOT1"))
+bot2 = Bot(token=os.getenv("BOT2"))
+bot3 = Bot(token=os.getenv("BOT3"))
+
+dp = Dispatcher()
+
+# Створюємо під-модель для однієї репліки
+class BotReply(BaseModel):
+    bot_id: str        # "bot_1" або "bot_2"
+    text: str          # Текст репліки
+
+# Оновлюємо головну модель
+class GameResponse(BaseModel):
+    replies: List[BotReply]
+    new_facts: List[str]
+    scene_goal_reached: bool  # НОВЕ ПОЛЕ ДЛЯ ШІ
+
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+# 1. Оновлюємо структуру БД: додаємо message_id і UNIQUE
+async def init_db():
+    async with aiosqlite.connect("chat_history.db") as db:
+        # Таблиця повідомлень (вже існує)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                message_id INTEGER,
+                sender TEXT,
+                text TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, message_id)
+            )
+        """)
+        # Нова таблиця для фактів про користувача
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                fact TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Нова таблиця для відстеження сюжету
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_states (
+                chat_id INTEGER PRIMARY KEY,
+                current_stage INTEGER DEFAULT 1
+            )
+        """)
+        await db.commit()
+
+async def get_chat_stage(chat_id: int):
+    async with aiosqlite.connect("chat_history.db") as db:
+        async with db.execute("SELECT current_stage FROM chat_states WHERE chat_id = ?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 1
+
+async def advance_chat_stage(chat_id: int):
+    async with aiosqlite.connect("chat_history.db") as db:
+        await db.execute("INSERT INTO chat_states (chat_id, current_stage) VALUES (?, 2) ON CONFLICT(chat_id) DO UPDATE SET current_stage = current_stage + 1", (chat_id,))
+        await db.commit()
+
+# Функція для збереження нового факту
+async def save_fact(chat_id: int, fact: str):
+    async with aiosqlite.connect("chat_history.db") as db:
+        await db.execute(
+            "INSERT INTO memories (chat_id, fact) VALUES (?, ?)",
+            (chat_id, fact)
+        )
+        await db.commit()
+
+# Функція для отримання всіх знаних фактів про користувача
+async def get_user_memories(chat_id: int):
+    async with aiosqlite.connect("chat_history.db") as db:
+        async with db.execute("SELECT fact FROM memories WHERE chat_id = ?", (chat_id,)) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+
+async def get_chat_history(chat_id: int, limit: int = 10):
+    async with aiosqlite.connect("chat_history.db") as db:
+        async with db.execute(
+            "SELECT sender, text FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?",
+            (chat_id, limit)
+        ) as cursor:
+            # Отримуємо записи, але вони йдуть від найновішого до найстарішого.
+            # Нам треба перевернути їх, щоб діалог читався нормально.
+            rows = await cursor.fetchall()
+            return rows[::-1]
+
+
+async def generate_and_send_response(chat_id: int, bot1_id: int, bot2_id: int, bot3_id: int):
+    history = await get_chat_history(chat_id, limit=15)
+    existing_memories = await get_user_memories(chat_id)
+    
+    dialogue = "\n".join([f"{row[0]}: {row[1]}" for row in history])
+    memories_str = "\n".join([f"- {m}" for m in existing_memories]) if existing_memories else "Даних немає."
+
+    current_stage = await get_chat_stage(chat_id)
+    stage_info = STORY_STAGES.get(current_stage, {"title": "Вільна гра", "context": "Просто спілкування.", "goal": "Немає"})
+
+    prompt = f"""
+    ТИ — РЕЖИСЕР DARK ROMANCE ГРИ "АКАДЕМІЯ СВЯТОГО ЮДИ".
+    
+    ПОТОЧНА СЮЖЕТНА ГЛАВА: {stage_info['title']}
+    КОНТЕКСТ СЦЕНИ: {stage_info['context']}
+    МЕТА СЦЕНИ: {stage_info['goal']}
+
+    ПЕРСОНАЖІ:
+    - bot_{bot1_id} (Кай): {CHARACTERS['kai']['style']}
+    - bot_{bot2_id} (Доріан): {CHARACTERS['dorian']['style']}
+    - bot_{bot3_id} (Люціан): {CHARACTERS['lucian']['style']}
+    
+    ДОСЬЄ ГРАВЦЯ (user):
+    {memories_str}
+    
+    ДІАЛОГ:
+    {dialogue}
+    
+    🔥 ПРАВИЛА ДИНАМІКИ ТА СУПЕРНИЦТВА (НОВИЙ БАЛАНС) 🔥:
+    1. ЖИВИЙ ДІАЛОГ: Дозволь повідомленням бути трохи довшими (2-3 речення), щоб боти могли нормально висловити думку, підколоти або щось пояснити про Академію.
+    2. ЕФЕКТ РЕВНОЩІВ (КРИТИЧНО): Кай і Доріан — суперники. Якщо user пише ТІЛЬКИ Каю, Доріан має право влізти в розмову наступною реплікою, щоб висміяти Кая або переманити увагу дівчини на себе. І навпаки. 
+    3. КІЛЬКІСТЬ РЕПЛІК: Зазвичай повертай 2 (ДВІ) репліки поспіль. Наприклад: спочатку відповідає той, до кого звернулися, а потім його суперник коментує це. 
+    4. СУВОРЕ ПРАВИЛО ЛЮЦІАНА (bot_{bot3_id}): Люціан все ще залишається в тіні. Він НЕ втручається в побутові перепалки Кая і Доріана. Він пише ЛИШЕ тоді, коли user прямо звертається до нього (називає "Люц", "Люціан"), або якщо в чаті піднімається тема страху, секретів чи нічних прогулянок Академією.
+    5. АТМОСФЕРА: Боти повинні давати легкі натяки на те, як влаштована Академія (правила, класи, ієрархія), щоб юзер розумів сюжет.
+    
+    ПРАВИЛО СЮЖЕТУ:
+    Оціни, чи досягнута "МЕТА СЦЕНИ" в останніх повідомленнях гравця. Якщо так — встанови `scene_goal_reached` = true. Якщо розмова ще триває — false.
+    """
+    
+    response = await client.aio.models.generate_content(
+        model='gemini-3.1-flash-lite',
+        contents=prompt,
+        config={
+            'response_mime_type': 'application/json',
+            'response_schema': GameResponse,
+        }
+    )
+    
+    try:
+        data = json.loads(response.text)
+        replies = data.get("replies", [])
+        new_facts = data.get("new_facts", [])
+        
+        # Витягуємо прапорець перемикання сцени прямо тут
+        scene_goal_reached = data.get("scene_goal_reached", False)
+        
+        for fact in new_facts:
+            await save_fact(chat_id, fact)
+            print(f"[{chat_id}] МЕНТАЛЬНИЙ ЗАПИС: {fact}")
+            
+        # ПОВЕРТАЄМО ОБИДВА ПАРАМЕТРИ ЯК ТУПЛЬ (TUPLE)
+        return replies, scene_goal_reached
+        
+    except Exception as e:
+        print(f"Помилка обробки JSON від ШІ: {e}")
+        return [], False # У разі помилки повертаємо порожній список і false
+
+# 2. Оновлюємо функцію збереження (використовуємо INSERT OR IGNORE)
+async def save_message(chat_id: int, message_id: int, sender: str, text: str):
+    async with aiosqlite.connect("chat_history.db") as db:
+        # INSERT OR IGNORE тихо пропустить запис, якщо такий chat_id + message_id вже є
+        await db.execute(
+            "INSERT OR IGNORE INTO messages (chat_id, message_id, sender, text) VALUES (?, ?, ?, ?)",
+            (chat_id, message_id, sender, text)
+        )
+        await db.commit()
+
+# 3. Оновлюємо хендлер: додаємо параметр bot: Bot
+@dp.message()
+async def handle_message(message: Message, bot: Bot):
+    if bot.id != bot1.id:
+        return
+
+    chat_id = message.chat.id
+    if not message.text:
+        return
+
+    if message.text != "/start_story" and message.text != "/start_story@tgTeller_bot":
+        # Обробка Reply (на що саме відповідає юзер)
+        actual_text = message.text
+        if message.reply_to_message and message.reply_to_message.text:
+            replied_to = message.reply_to_message.text[:50] + "..."
+            actual_text = f"{message.text} (Примітка: це реплай на повідомлення '{replied_to}')"
+
+        sender = f"bot_{message.from_user.id}" if message.from_user.is_bot else "user"
+        await save_message(chat_id, message.message_id, sender, actual_text)
+        
+        if sender == "user":
+            await bot1.send_chat_action(chat_id=chat_id, action="typing")
+            
+            # ПРИЙМАЄМО ОБИДВА ЗНАЧЕННЯ ОДНОЧАСНО
+            ai_replies, scene_goal_reached = await generate_and_send_response(chat_id, bot1.id, bot2.id, bot3.id)
+            
+            if ai_replies:
+                ai_replies = ai_replies[:2] # Запобіжник на макс. 2 репліки
+                
+                for reply in ai_replies:
+                    ai_sender = reply.get("bot_id")
+                    ai_text = reply.get("text")
+                    
+                    if str(bot3.id) in ai_sender and "люц" not in message.text.lower():
+                        continue 
+                        
+                    typing_time = min(max(len(ai_text) / 30, 1), 3)
+                    
+                    if str(bot1.id) in ai_sender:
+                        await bot1.send_chat_action(chat_id=chat_id, action="typing")
+                        await asyncio.sleep(typing_time)
+                        sent_msg = await bot1.send_message(chat_id, ai_text)
+                        await save_message(chat_id, sent_msg.message_id, f"bot_{bot1.id}", ai_text)
+                        
+                    elif str(bot2.id) in ai_sender:
+                        await bot2.send_chat_action(chat_id=chat_id, action="typing")
+                        await asyncio.sleep(typing_time)
+                        sent_msg = await bot2.send_message(chat_id, ai_text)
+                        await save_message(chat_id, sent_msg.message_id, f"bot_{bot2.id}", ai_text)
+                        
+                    elif str(bot3.id) in ai_sender:
+                        await bot3.send_chat_action(chat_id=chat_id, action="typing")
+                        await asyncio.sleep(typing_time)
+                        sent_msg = await bot3.send_message(chat_id, ai_text)
+                        await save_message(chat_id, sent_msg.message_id, f"bot_{bot3.id}", ai_text)
+
+                # === ПЕРЕВІРКУ СЦЕНИ ===
+                if scene_goal_reached:
+                    current_stage = await get_chat_stage(chat_id)
+                    next_stage = current_stage + 1
+                    
+                    if next_stage in STORY_STAGES:
+                        await asyncio.sleep(4)
+                        intro_text = STORY_STAGES[current_stage]["next_scene_intro"]
+                        await bot1.send_message(chat_id, intro_text)
+                        await advance_chat_stage(chat_id)
+                        await save_message(chat_id, 0, "system", intro_text)
+                        print(f"[{chat_id}] СЮЖЕТ ПЕРЕЙШОВ НА ГЛАВУ {next_stage}")
+                    else:
+                        # СЮЖЕТ ЗАКІНЧИВСЯ!
+                        await asyncio.sleep(4)
+                        end_text = (
+                            "🎬 *КІНЕЦЬ ДЕМО-ВЕРСІЇ* 🎬\n\n"
+                            "Дякуємо, що зіграли в перший епізод 'Академії Святого Юди'. "
+                            "Попереду ще багато таємниць. Введіть /reset, щоб спробувати інші варіанти діалогів!"
+                        )
+                        await bot1.send_message(chat_id, end_text)
+                        # Можна також заблокувати подальші відповіді ботів, але для демо вистачить і цього.
+    else:
+        # 1. Повноцінний вступ для гравця
+        intro_text = (
+            "🎓 *АКАДЕМІЯ СВЯТОГО ЮДИ* 🎓\n\n"
+            "Ви — нова учениця в елітній закритій школі. Завтра ваш перший день. "
+            "Раптом ваш телефон вібрує. Хтось анонімно додав вас у приватний чат...\n\n"
+            "*(Системне повідомлення: Користувач '<span class=\"tg-spoiler\">ㅤㅤㅤㅤㅤㅤ</span>' додав вас до групи 'Еліта Юди')*"
+        )
+        await teller.send_message(chat_id, intro_text, parse_mode="html")
+        await asyncio.sleep(3)
+        
+        # 2. Боти починають реагувати на появу новенької
+        kai_msg = await bot1.send_message(chat_id, "Гей, хтось щойно додав сюди новий контакт. Це та сама новенька, що перевелася до нас? Привіт, як звати?) 👋 Я Кай.")
+        await save_message(chat_id, kai_msg.message_id, f"bot_{bot1.id}", kai_msg.text)
+        await asyncio.sleep(3)
+        
+        dorian_msg = await bot2.send_message(chat_id, "Кай, ти як завжди радієш усім підряд. <span class=\"tg-spoiler\">ㅤㅤㅤㅤㅤㅤ</span> знову грає в свої ігри. Дівчино, хто б ти не була, краще вийди з цього чату, поки можеш.", parse_mode="html")
+        await save_message(chat_id, dorian_msg.message_id, f"bot_{bot2.id}", dorian_msg.text)
+        
+        await save_fact(chat_id, "Новенька в Академії, завтра перший день")
+
+
+async def main():
+    await init_db()
+    await dp.start_polling(bot1, bot2, bot3)
+
+if __name__ == "__main__":
+    asyncio.run(main())
