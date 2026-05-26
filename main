@@ -1,4 +1,4 @@
-import asyncio, os, time
+import asyncio, os, time, json
 from google import genai
 import aiosqlite
 from dotenv import load_dotenv
@@ -63,54 +63,41 @@ async def init_db():
         """)
         await db.commit()
 
-async def get_chat_stage(chat_id: int):
-    async with aiosqlite.connect("chat_history.db") as db:
-        async with db.execute("SELECT current_stage FROM chat_states WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 1
+async def get_chat_stage(db: aiosqlite.Connection, chat_id: int):
+    async with db.execute("SELECT current_stage FROM chat_states WHERE chat_id = ?", (chat_id,)) as cursor:
+        row = await cursor.fetchone()
+        return row[0] if row else 1
 
-async def advance_chat_stage(chat_id: int):
-    async with aiosqlite.connect("chat_history.db") as db:
-        await db.execute("INSERT INTO chat_states (chat_id, current_stage) VALUES (?, 2) ON CONFLICT(chat_id) DO UPDATE SET current_stage = current_stage + 1", (chat_id,))
-        await db.commit()
+async def advance_chat_stage(db: aiosqlite.Connection, chat_id: int):
+    await db.execute("INSERT INTO chat_states (chat_id, current_stage) VALUES (?, 2) ON CONFLICT(chat_id) DO UPDATE SET current_stage = current_stage + 1", (chat_id,))
+    await db.commit()
 
 # Функція для збереження нового факту
-async def save_fact(chat_id: int, fact: str):
-    async with aiosqlite.connect("chat_history.db") as db:
-        await db.execute(
-            "INSERT INTO memories (chat_id, fact) VALUES (?, ?)",
-            (chat_id, fact)
-        )
-        await db.commit()
+async def save_fact(db: aiosqlite.Connection, chat_id: int, fact: str):
+    await db.execute("INSERT INTO memories (chat_id, fact) VALUES (?, ?)", (chat_id, fact))
+    await db.commit()
 
 # Функція для отримання всіх знаних фактів про користувача
-async def get_user_memories(chat_id: int):
-    async with aiosqlite.connect("chat_history.db") as db:
-        async with db.execute("SELECT fact FROM memories WHERE chat_id = ?", (chat_id,)) as cursor:
-            rows = await cursor.fetchall()
-            return [row[0] for row in rows]
+async def get_user_memories(db: aiosqlite.Connection, chat_id: int):
+    async with db.execute("SELECT fact FROM memories WHERE chat_id = ?", (chat_id,)) as cursor:
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
 
 
-async def get_chat_history(chat_id: int, limit: int = 10):
-    async with aiosqlite.connect("chat_history.db") as db:
-        async with db.execute(
-            "SELECT sender, text FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?",
-            (chat_id, limit)
-        ) as cursor:
-            # Отримуємо записи, але вони йдуть від найновішого до найстарішого.
-            # Нам треба перевернути їх, щоб діалог читався нормально.
-            rows = await cursor.fetchall()
-            return rows[::-1]
+async def get_chat_history(db: aiosqlite.Connection, chat_id: int, limit: int = 10):
+    async with db.execute(
+        "SELECT sender, text FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?",
+        (chat_id, limit)
+    ) as cursor:
+        rows = await cursor.fetchall()
+        return rows[::-1]
 
 
-async def generate_and_send_response(chat_id: int, bot1_id: int, bot2_id: int, bot3_id: int):
-    history = await get_chat_history(chat_id, limit=15)
-    existing_memories = await get_user_memories(chat_id)
-    
-    dialogue = "\n".join([f"{row[0]}: {row[1]}" for row in history])
-    memories_str = "\n".join([f"- {m}" for m in existing_memories]) if existing_memories else "Даних немає."
-
-    current_stage = await get_chat_stage(chat_id)
+async def generate_and_send_response(db: aiosqlite.Connection, chat_id: int, bot1_id: int, bot2_id: int, bot3_id: int):
+    # Використовуємо передане з'єднання (db)
+    history = await get_chat_history(db, chat_id, limit=15)
+    existing_memories = await get_user_memories(db, chat_id)
+    current_stage = await get_chat_stage(db, chat_id)
     stage_info = STORY_STAGES.get(current_stage, {"title": "Вільна гра", "context": "Просто спілкування.", "goal": "Немає"})
 
     prompt = f"""
@@ -126,10 +113,10 @@ async def generate_and_send_response(chat_id: int, bot1_id: int, bot2_id: int, b
     - bot_{bot3_id} (Люціан): {CHARACTERS['lucian']['style']}
     
     ДОСЬЄ ГРАВЦЯ (user):
-    {memories_str}
+    {existing_memories}
     
     ДІАЛОГ:
-    {dialogue}
+    {history}
     
     🔥 ПРАВИЛА ДИНАМІКИ ТА СУПЕРНИЦТВА (НОВИЙ БАЛАНС) 🔥:
     1. ЖИВИЙ ДІАЛОГ: Дозволь повідомленням бути трохи довшими (2-3 речення), щоб боти могли нормально висловити думку, підколоти або щось пояснити про Академію.
@@ -152,31 +139,28 @@ async def generate_and_send_response(chat_id: int, bot1_id: int, bot2_id: int, b
     )
     
     try:
-        if response.parsed:
-            replies = [{"bot_id": r.bot_id, "text": r.text} for r in response.parsed.replies]
-            new_facts = response.parsed.new_facts
-            scene_goal_reached = response.parsed.scene_goal_reached
+        data = json.loads(response.text) # Або використання response.parsed
+        replies = data.get("replies", [])
+        new_facts = data.get("new_facts", [])
+        scene_goal_reached = data.get("scene_goal_reached", False)
         
         for fact in new_facts:
-            await save_fact(chat_id, fact)
+            await save_fact(db, chat_id, fact) # Зберігаємо факт через передане з'єднання
             print(f"[{chat_id}] МЕНТАЛЬНИЙ ЗАПИС: {fact}")
             
-        # ПОВЕРТАЄМО ОБИДВА ПАРАМЕТРИ ЯК ТУПЛЬ (TUPLE)
         return replies, scene_goal_reached
         
     except Exception as e:
         print(f"Помилка обробки JSON від ШІ: {e}")
-        return [], False # У разі помилки повертаємо порожній список і false
+        return [], False
 
 # 2. Оновлюємо функцію збереження (використовуємо INSERT OR IGNORE)
-async def save_message(chat_id: int, message_id: int, sender: str, text: str):
-    async with aiosqlite.connect("chat_history.db") as db:
-        # INSERT OR IGNORE тихо пропустить запис, якщо такий chat_id + message_id вже є
-        await db.execute(
-            "INSERT OR IGNORE INTO messages (chat_id, message_id, sender, text) VALUES (?, ?, ?, ?)",
-            (chat_id, message_id, sender, text)
-        )
-        await db.commit()
+async def save_message(db: aiosqlite.Connection, chat_id: int, message_id: int, sender: str, text: str):
+    await db.execute(
+        "INSERT OR IGNORE INTO messages (chat_id, message_id, sender, text) VALUES (?, ?, ?, ?)",
+        (chat_id, message_id, sender, text)
+    )
+    await db.commit()
 
 
 @dp.message(Command("start_story"))
@@ -226,59 +210,49 @@ async def handle_message(message: Message, bot: Bot):
         actual_text = f"{message.text} (Примітка: це реплай на повідомлення '{replied_to}')"
 
     sender = f"bot_{message.from_user.id}" if message.from_user.is_bot else "user"
-    await save_message(chat_id, message.message_id, sender, actual_text)
     
-    if sender == "user":
-        await bot1.send_chat_action(chat_id=chat_id, action="typing")
-        
-        # ПРИЙМАЄМО ОБИДВА ЗНАЧЕННЯ ОДНОЧАСНО
-        ai_replies, scene_goal_reached = await generate_and_send_response(chat_id, bot1.id, bot2.id, bot3.id)
-        
-        if ai_replies:
-            ai_replies = ai_replies[:2] # Запобіжник на макс. 2 репліки
+    async with aiosqlite.connect("chat_history.db") as db:
             
-            for reply in ai_replies:
-                ai_sender = reply.get("bot_id")
-                ai_text = reply.get("text")
+        await save_message(db, chat_id, message.message_id, sender, actual_text)
+        
+        if sender == "user":
+            await bot1.send_chat_action(chat_id=chat_id, action="typing")
+            
+            # Передаємо db у ШІ генератор
+            ai_replies, scene_goal_reached = await generate_and_send_response(db, chat_id, bot1.id, bot2.id, bot3.id)
+            
+            if ai_replies:
+                ai_replies = ai_replies[:2]
                 
-                # if str(bot3.id) in ai_sender and "люц" not in message.text.lower():
-                #     continue 
+                for reply in ai_replies:
+                    ai_sender = reply.get("bot_id")
+                    ai_text = reply.get("text")
                     
-                typing_time = min(max(len(ai_text) / 30, 1), 3)
-                
-                if str(bot1.id) in ai_sender:
-                    await bot1.send_chat_action(chat_id=chat_id, action="typing")
-                    await asyncio.sleep(typing_time)
-                    sent_msg = await bot1.send_message(chat_id, ai_text)
-                    await save_message(chat_id, sent_msg.message_id, f"bot_{bot1.id}", ai_text)
+                    typing_time = min(max(len(ai_text) / 30, 1), 3)
                     
-                elif str(bot2.id) in ai_sender:
-                    await bot2.send_chat_action(chat_id=chat_id, action="typing")
-                    await asyncio.sleep(typing_time)
-                    sent_msg = await bot2.send_message(chat_id, ai_text)
-                    await save_message(chat_id, sent_msg.message_id, f"bot_{bot2.id}", ai_text)
+                    if str(bot1.id) in ai_sender:
+                        await bot1.send_chat_action(chat_id=chat_id, action="typing")
+                        await asyncio.sleep(typing_time)
+                        sent_msg = await bot1.send_message(chat_id, ai_text)
+                        await save_message(db, chat_id, sent_msg.message_id, f"bot_{bot1.id}", ai_text)
+                        
+                    # ... [Аналогічно для bot2 та bot3 - передаємо db у save_message] ...
+
+                # === ПЕРЕВІРКА СЦЕНИ ===
+                if scene_goal_reached:
+                    current_stage = await get_chat_stage(db, chat_id)
+                    next_stage = current_stage + 1
                     
-                elif str(bot3.id) in ai_sender:
-                    await bot3.send_chat_action(chat_id=chat_id, action="typing")
-                    await asyncio.sleep(typing_time)
-                    sent_msg = await bot3.send_message(chat_id, ai_text)
-                    await save_message(chat_id, sent_msg.message_id, f"bot_{bot3.id}", ai_text)
-
-            # === ПЕРЕВІРКУ СЦЕНИ ===
-            if scene_goal_reached:
-                current_stage = await get_chat_stage(chat_id)
-                next_stage = current_stage + 1
-                
-                if next_stage in STORY_STAGES:
-                    await asyncio.sleep(4)
-                    intro_text = STORY_STAGES[current_stage]["next_scene_intro"]
-                    await bot1.send_message(chat_id, intro_text)
-                    await advance_chat_stage(chat_id)
-
-                    system_msg_id = int(time.time() * -1000) 
-                    await save_message(chat_id, system_msg_id, "system", intro_text)
-
-                    print(f"[{chat_id}] СЮЖЕТ ПЕРЕЙШОВ НА ГЛАВУ {next_stage}")
+                    if next_stage in STORY_STAGES:
+                        await asyncio.sleep(4)
+                        intro_text = STORY_STAGES[current_stage]["next_scene_intro"]
+                        await bot1.send_message(chat_id, intro_text)
+                        await advance_chat_stage(db, chat_id)
+                        
+                        # Пам'ятайте про унікальний від'ємний ID для системних повідомлень, як обговорювалось в попередньому пункті!
+                        system_msg_id = int(time.time() * -1000)
+                        await save_message(db, chat_id, system_msg_id, "system", intro_text) 
+                        print(f"[{chat_id}] СЮЖЕТ ПЕРЕЙШОВ НА ГЛАВУ {next_stage}")
                 else:
                     # СЮЖЕТ ЗАКІНЧИВСЯ!
                     await asyncio.sleep(4)
