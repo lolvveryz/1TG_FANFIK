@@ -1,10 +1,10 @@
-import asyncio, os
+import asyncio, os, time
 from google import genai
 import aiosqlite
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
-import json
+from aiogram.filters import Command
 from pydantic import BaseModel
 from typing import List
 from desc import CHARACTERS, STORY_STAGES
@@ -19,8 +19,8 @@ dp = Dispatcher()
 
 # Створюємо під-модель для однієї репліки
 class BotReply(BaseModel):
-    bot_id: str        # "bot_1" або "bot_2"
-    text: str          # Текст репліки
+    bot_id: str        # Формат: "bot_123456789" (реальний ID бота, як вказано у промпті)
+    text: str
 
 # Оновлюємо головну модель
 class GameResponse(BaseModel):
@@ -152,12 +152,10 @@ async def generate_and_send_response(chat_id: int, bot1_id: int, bot2_id: int, b
     )
     
     try:
-        data = json.loads(response.text)
-        replies = data.get("replies", [])
-        new_facts = data.get("new_facts", [])
-        
-        # Витягуємо прапорець перемикання сцени прямо тут
-        scene_goal_reached = data.get("scene_goal_reached", False)
+        if response.parsed:
+            replies = [{"bot_id": r.bot_id, "text": r.text} for r in response.parsed.replies]
+            new_facts = response.parsed.new_facts
+            scene_goal_reached = response.parsed.scene_goal_reached
         
         for fact in new_facts:
             await save_fact(chat_id, fact)
@@ -180,6 +178,37 @@ async def save_message(chat_id: int, message_id: int, sender: str, text: str):
         )
         await db.commit()
 
+
+@dp.message(Command("start_story"))
+async def handle_start(message: Message, bot: Bot):
+    if bot.id != bot1.id:
+        return
+
+    chat_id = message.chat.id
+    if not message.text:
+        return
+
+    # 1. Повноцінний вступ для гравця
+    intro_text = (
+        "🎓 *АКАДЕМІЯ СВЯТОГО ЮДИ* 🎓\n\n"
+        "Ви — нова учениця в елітній закритій школі. Завтра ваш перший день. "
+        "Раптом ваш телефон вібрує. Хтось анонімно додав вас у приватний чат...\n\n"
+        "*(Системне повідомлення: Користувач '<span class=\"tg-spoiler\">ㅤㅤㅤㅤㅤㅤ</span>' додав вас до групи 'Еліта Юди')*"
+        )
+    
+    await teller.send_message(chat_id, intro_text, parse_mode="html")
+    await asyncio.sleep(3)
+    
+    # 2. Боти починають реагувати на появу новенької
+    kai_msg = await bot1.send_message(chat_id, "Гей, хтось щойно додав сюди новий контакт. Це та сама новенька, що перевелася до нас? Привіт, як звати?) 👋 Я Кай.")
+    await save_message(chat_id, kai_msg.message_id, f"bot_{bot1.id}", kai_msg.text)
+    await asyncio.sleep(3)
+    
+    dorian_msg = await bot2.send_message(chat_id, "Кай, ти як завжди радієш усім підряд. <span class=\"tg-spoiler\">ㅤㅤㅤㅤㅤㅤ</span> знову грає в свої ігри. Дівчино, хто б ти не була, краще вийди з цього чату, поки можеш.", parse_mode="html")
+    await save_message(chat_id, dorian_msg.message_id, f"bot_{bot2.id}", dorian_msg.text)
+    
+    await save_fact(chat_id, "Новенька в Академії, завтра перший день")
+
 # 3. Оновлюємо хендлер: додаємо параметр bot: Bot
 @dp.message()
 async def handle_message(message: Message, bot: Bot):
@@ -190,95 +219,79 @@ async def handle_message(message: Message, bot: Bot):
     if not message.text:
         return
 
-    if message.text != "/start_story" and message.text != "/start_story@tgTeller_bot":
-        # Обробка Reply (на що саме відповідає юзер)
-        actual_text = message.text
-        if message.reply_to_message and message.reply_to_message.text:
-            replied_to = message.reply_to_message.text[:50] + "..."
-            actual_text = f"{message.text} (Примітка: це реплай на повідомлення '{replied_to}')"
+    # Обробка Reply (на що саме відповідає юзер)
+    actual_text = message.text
+    if message.reply_to_message and message.reply_to_message.text:
+        replied_to = message.reply_to_message.text[:50] + "..."
+        actual_text = f"{message.text} (Примітка: це реплай на повідомлення '{replied_to}')"
 
-        sender = f"bot_{message.from_user.id}" if message.from_user.is_bot else "user"
-        await save_message(chat_id, message.message_id, sender, actual_text)
+    sender = f"bot_{message.from_user.id}" if message.from_user.is_bot else "user"
+    await save_message(chat_id, message.message_id, sender, actual_text)
+    
+    if sender == "user":
+        await bot1.send_chat_action(chat_id=chat_id, action="typing")
         
-        if sender == "user":
-            await bot1.send_chat_action(chat_id=chat_id, action="typing")
+        # ПРИЙМАЄМО ОБИДВА ЗНАЧЕННЯ ОДНОЧАСНО
+        ai_replies, scene_goal_reached = await generate_and_send_response(chat_id, bot1.id, bot2.id, bot3.id)
+        
+        if ai_replies:
+            ai_replies = ai_replies[:2] # Запобіжник на макс. 2 репліки
             
-            # ПРИЙМАЄМО ОБИДВА ЗНАЧЕННЯ ОДНОЧАСНО
-            ai_replies, scene_goal_reached = await generate_and_send_response(chat_id, bot1.id, bot2.id, bot3.id)
-            
-            if ai_replies:
-                ai_replies = ai_replies[:2] # Запобіжник на макс. 2 репліки
+            for reply in ai_replies:
+                ai_sender = reply.get("bot_id")
+                ai_text = reply.get("text")
                 
-                for reply in ai_replies:
-                    ai_sender = reply.get("bot_id")
-                    ai_text = reply.get("text")
+                # if str(bot3.id) in ai_sender and "люц" not in message.text.lower():
+                #     continue 
                     
-                    if str(bot3.id) in ai_sender and "люц" not in message.text.lower():
-                        continue 
-                        
-                    typing_time = min(max(len(ai_text) / 30, 1), 3)
+                typing_time = min(max(len(ai_text) / 30, 1), 3)
+                
+                if str(bot1.id) in ai_sender:
+                    await bot1.send_chat_action(chat_id=chat_id, action="typing")
+                    await asyncio.sleep(typing_time)
+                    sent_msg = await bot1.send_message(chat_id, ai_text)
+                    await save_message(chat_id, sent_msg.message_id, f"bot_{bot1.id}", ai_text)
                     
-                    if str(bot1.id) in ai_sender:
-                        await bot1.send_chat_action(chat_id=chat_id, action="typing")
-                        await asyncio.sleep(typing_time)
-                        sent_msg = await bot1.send_message(chat_id, ai_text)
-                        await save_message(chat_id, sent_msg.message_id, f"bot_{bot1.id}", ai_text)
-                        
-                    elif str(bot2.id) in ai_sender:
-                        await bot2.send_chat_action(chat_id=chat_id, action="typing")
-                        await asyncio.sleep(typing_time)
-                        sent_msg = await bot2.send_message(chat_id, ai_text)
-                        await save_message(chat_id, sent_msg.message_id, f"bot_{bot2.id}", ai_text)
-                        
-                    elif str(bot3.id) in ai_sender:
-                        await bot3.send_chat_action(chat_id=chat_id, action="typing")
-                        await asyncio.sleep(typing_time)
-                        sent_msg = await bot3.send_message(chat_id, ai_text)
-                        await save_message(chat_id, sent_msg.message_id, f"bot_{bot3.id}", ai_text)
+                elif str(bot2.id) in ai_sender:
+                    await bot2.send_chat_action(chat_id=chat_id, action="typing")
+                    await asyncio.sleep(typing_time)
+                    sent_msg = await bot2.send_message(chat_id, ai_text)
+                    await save_message(chat_id, sent_msg.message_id, f"bot_{bot2.id}", ai_text)
+                    
+                elif str(bot3.id) in ai_sender:
+                    await bot3.send_chat_action(chat_id=chat_id, action="typing")
+                    await asyncio.sleep(typing_time)
+                    sent_msg = await bot3.send_message(chat_id, ai_text)
+                    await save_message(chat_id, sent_msg.message_id, f"bot_{bot3.id}", ai_text)
 
-                # === ПЕРЕВІРКУ СЦЕНИ ===
-                if scene_goal_reached:
-                    current_stage = await get_chat_stage(chat_id)
-                    next_stage = current_stage + 1
-                    
-                    if next_stage in STORY_STAGES:
-                        await asyncio.sleep(4)
-                        intro_text = STORY_STAGES[current_stage]["next_scene_intro"]
-                        await bot1.send_message(chat_id, intro_text)
-                        await advance_chat_stage(chat_id)
-                        await save_message(chat_id, 0, "system", intro_text)
-                        print(f"[{chat_id}] СЮЖЕТ ПЕРЕЙШОВ НА ГЛАВУ {next_stage}")
-                    else:
-                        # СЮЖЕТ ЗАКІНЧИВСЯ!
-                        await asyncio.sleep(4)
-                        end_text = (
-                            "🎬 *КІНЕЦЬ ДЕМО-ВЕРСІЇ* 🎬\n\n"
-                            "Дякуємо, що зіграли в перший епізод 'Академії Святого Юди'. "
-                            "Попереду ще багато таємниць. Введіть /reset, щоб спробувати інші варіанти діалогів!"
-                        )
-                        await bot1.send_message(chat_id, end_text)
-                        # Можна також заблокувати подальші відповіді ботів, але для демо вистачить і цього.
-    else:
-        # 1. Повноцінний вступ для гравця
-        intro_text = (
-            "🎓 *АКАДЕМІЯ СВЯТОГО ЮДИ* 🎓\n\n"
-            "Ви — нова учениця в елітній закритій школі. Завтра ваш перший день. "
-            "Раптом ваш телефон вібрує. Хтось анонімно додав вас у приватний чат...\n\n"
-            "*(Системне повідомлення: Користувач '<span class=\"tg-spoiler\">ㅤㅤㅤㅤㅤㅤ</span>' додав вас до групи 'Еліта Юди')*"
-        )
-        await teller.send_message(chat_id, intro_text, parse_mode="html")
-        await asyncio.sleep(3)
-        
-        # 2. Боти починають реагувати на появу новенької
-        kai_msg = await bot1.send_message(chat_id, "Гей, хтось щойно додав сюди новий контакт. Це та сама новенька, що перевелася до нас? Привіт, як звати?) 👋 Я Кай.")
-        await save_message(chat_id, kai_msg.message_id, f"bot_{bot1.id}", kai_msg.text)
-        await asyncio.sleep(3)
-        
-        dorian_msg = await bot2.send_message(chat_id, "Кай, ти як завжди радієш усім підряд. <span class=\"tg-spoiler\">ㅤㅤㅤㅤㅤㅤ</span> знову грає в свої ігри. Дівчино, хто б ти не була, краще вийди з цього чату, поки можеш.", parse_mode="html")
-        await save_message(chat_id, dorian_msg.message_id, f"bot_{bot2.id}", dorian_msg.text)
-        
-        await save_fact(chat_id, "Новенька в Академії, завтра перший день")
+            # === ПЕРЕВІРКУ СЦЕНИ ===
+            if scene_goal_reached:
+                current_stage = await get_chat_stage(chat_id)
+                next_stage = current_stage + 1
+                
+                if next_stage in STORY_STAGES:
+                    await asyncio.sleep(4)
+                    intro_text = STORY_STAGES[current_stage]["next_scene_intro"]
+                    await bot1.send_message(chat_id, intro_text)
+                    await advance_chat_stage(chat_id)
 
+                    system_msg_id = int(time.time() * -1000) 
+                    await save_message(chat_id, system_msg_id, "system", intro_text)
+
+                    print(f"[{chat_id}] СЮЖЕТ ПЕРЕЙШОВ НА ГЛАВУ {next_stage}")
+                else:
+                    # СЮЖЕТ ЗАКІНЧИВСЯ!
+                    await asyncio.sleep(4)
+                    end_text = (
+                        "🎬 *КІНЕЦЬ ДЕМО-ВЕРСІЇ* 🎬\n\n"
+                        "Дякуємо, що зіграли в перший епізод 'Академії Святого Юди'. "
+                        "Попереду ще багато таємниць. Введіть /reset, щоб спробувати інші варіанти діалогів!"
+                    )
+                    await bot1.send_message(chat_id, end_text)
+                    # Можна також заблокувати подальші відповіді ботів, але для демо вистачить і цього.
+        else:
+            await bot1.send_message(chat_id, "*(Зв'язок з Академією тимчасово перервано. Спробуйте ще раз.)*")
+            return
 
 async def main():
     await init_db()
