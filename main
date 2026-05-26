@@ -102,15 +102,14 @@ async def generate_and_send_response(db: aiosqlite.Connection, chat_id: int, bot
 
     prompt = f"""
     ТИ — РЕЖИСЕР DARK ROMANCE ГРИ "АКАДЕМІЯ СВЯТОГО ЮДИ".
-    
     ПОТОЧНА СЮЖЕТНА ГЛАВА: {stage_info['title']}
     КОНТЕКСТ СЦЕНИ: {stage_info['context']}
-    МЕТА СЦЕНИ: {stage_info['goal']}
+    МЕТА СЦЕНИ (ДЛЯ РЕЖИСЕРА, АЛЕ ПРИХОВАНА ВІД БОТІВ): {stage_info['goal']}
 
-    ПЕРСОНАЖІ:
-    - bot_{bot1_id} (Кай): {CHARACTERS['kai']['style']}
-    - bot_{bot2_id} (Доріан): {CHARACTERS['dorian']['style']}
-    - bot_{bot3_id} (Люціан): {CHARACTERS['lucian']['style']}
+    ПЕРСОНАЖІ (ЇХНІЙ СТИЛЬ ТА ОСОБИСТІ МОТИВИ):
+    - bot_{bot1_id} (Кай). СТИЛЬ: {CHARACTERS['kai']['style']} | ОСОБИСТА МЕТА: {CHARACTERS['kai']['goal']}
+    - bot_{bot2_id} (Доріан). СТИЛЬ: {CHARACTERS['dorian']['style']} | ОСОБИСТА МЕТА: {CHARACTERS['dorian']['goal']}
+    - bot_{bot3_id} (Люціан). СТИЛЬ: {CHARACTERS['lucian']['style']} | ОСОБИСТА МЕТА: {CHARACTERS['lucian']['goal']}
     
     ДОСЬЄ ГРАВЦЯ (user):
     {existing_memories}
@@ -118,15 +117,19 @@ async def generate_and_send_response(db: aiosqlite.Connection, chat_id: int, bot
     ДІАЛОГ:
     {history}
     
-    🔥 ПРАВИЛА ДИНАМІКИ ТА СУПЕРНИЦТВА (НОВИЙ БАЛАНС) 🔥:
-    1. ЖИВИЙ ДІАЛОГ: Дозволь повідомленням бути трохи довшими (2-3 речення), щоб боти могли нормально висловити думку, підколоти або щось пояснити про Академію.
-    2. ЕФЕКТ РЕВНОЩІВ (КРИТИЧНО): Кай і Доріан — суперники. Якщо user пише ТІЛЬКИ Каю, Доріан має право влізти в розмову наступною реплікою, щоб висміяти Кая або переманити увагу дівчини на себе. І навпаки. 
-    3. КІЛЬКІСТЬ РЕПЛІК: Зазвичай повертай 2 (ДВІ) репліки поспіль. Наприклад: спочатку відповідає той, до кого звернулися, а потім його суперник коментує це. 
-    4. СУВОРЕ ПРАВИЛО ЛЮЦІАНА (bot_{bot3_id}): Люціан все ще залишається в тіні. Він НЕ втручається в побутові перепалки Кая і Доріана. Він пише ЛИШЕ тоді, коли user прямо звертається до нього (називає "Люц", "Люціан"), або якщо в чаті піднімається тема страху, секретів чи нічних прогулянок Академією.
-    5. АТМОСФЕРА: Боти повинні давати легкі натяки на те, як влаштована Академія (правила, класи, ієрархія), щоб юзер розумів сюжет.
+    🔥 КРИТИЧНІ ПРАВИЛА СПІЛКУВАННЯ (СУВОРО) 🔥:
+    1. ЗАБОРОНА НА УЛЬТИМАТУМИ: Персонажі НЕ ПОВИННІ вимагати вибору в кожному повідомленні. 
+    2. ЕМОЦІЙНА РЕАКЦІЯ ЧЕРЕЗ ПРИЗМУ МЕТИ: Реагуйте на слова гравця (навіть на крапки чи мати), спираючись на ОСОБИСТУ МЕТУ персонажа. Доріан має сприймати зухвалість як виклик його владі, Кай — як сигнал, що гравця треба захистити.
+    3. ЖИВИЙ ДІАЛОГ: Відповідайте природно (1-3 речення). Спочатку реакція на слова гравця, потім — дія за характером.
+    4. ЕФЕКТ РЕВНОЩІВ: Кай і Доріан коментують репліки один одного.
+    5. СУВОРЕ ПРАВИЛО ЛЮЦІАНА: Він пише ЛИШЕ тоді, коли user прямо звертається до нього. 
+    6. ВІДПОВІДІ (REPLY): Якщо в тексті user є "(Примітка: це пряма відповідь на повідомлення від...)", цей бот ПОВИНЕН відповісти їй першим.
+    
+    ПРАВИЛО ПАМ'ЯТІ (new_facts):
+    Записуй ТІЛЬКИ факти про ГРАВЦЯ.
     
     ПРАВИЛО СЮЖЕТУ:
-    Оціни, чи досягнута "МЕТА СЦЕНИ" в останніх повідомленнях гравця. Якщо так — встанови `scene_goal_reached` = true. Якщо розмова ще триває — false.
+    Оціни, чи досягнута "МЕТА СЦЕНИ". Став `scene_goal_reached` = true ТІЛЬКИ якщо рішення гравця ПРЯМЕ І ОСТАТОЧНЕ. Інакше — false.
     """
     
     response = await client.aio.models.generate_content(
@@ -227,13 +230,26 @@ async def handle_message(message: Message, bot: Bot):
     # Обробка Reply (на що саме відповідає юзер)
     actual_text = message.text
     if message.reply_to_message and message.reply_to_message.text:
-        replied_to = message.reply_to_message.text[:50] + "..."
-        actual_text = f"{message.text} (Примітка: це реплай на повідомлення '{replied_to}')"
+        replied_text = message.reply_to_message.text[:50] + "..."
+        reply_user_id = message.reply_to_message.from_user.id
+        
+        # Визначаємо, кому саме відповіла дівчина
+        if reply_user_id == bot1.id:
+            reply_target = "Кая"
+        elif reply_user_id == bot2.id:
+            reply_target = "Доріана"
+        elif reply_user_id == bot3.id:
+            reply_target = "Люціана"
+        elif reply_user_id == teller.id:
+            reply_target = "Оповідача"
+        else:
+            reply_target = "когось"
+
+        actual_text = f"{message.text} (Примітка: це пряма відповідь на повідомлення від {reply_target}: '{replied_text}')"
 
     sender = f"bot_{message.from_user.id}" if message.from_user.is_bot else "user"
     
     async with aiosqlite.connect("chat_history.db") as db:
-            
         await save_message(db, chat_id, message.message_id, sender, actual_text)
         
         if sender == "user":
@@ -243,7 +259,7 @@ async def handle_message(message: Message, bot: Bot):
             ai_replies, scene_goal_reached = await generate_and_send_response(db, chat_id, bot1.id, bot2.id, bot3.id)
             
             if ai_replies:
-                ai_replies = ai_replies[:2]
+                ai_replies = ai_replies
                 
                 for reply in ai_replies:
                     ai_sender = reply.get("bot_id")
