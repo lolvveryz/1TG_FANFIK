@@ -139,19 +139,23 @@ async def generate_and_send_response(db: aiosqlite.Connection, chat_id: int, bot
     )
     
     try:
-        data = json.loads(response.text) # Або використання response.parsed
-        replies = data.get("replies", [])
-        new_facts = data.get("new_facts", [])
-        scene_goal_reached = data.get("scene_goal_reached", False)
-        
-        for fact in new_facts:
-            await save_fact(db, chat_id, fact) # Зберігаємо факт через передане з'єднання
-            print(f"[{chat_id}] МЕНТАЛЬНИЙ ЗАПИС: {fact}")
+        # Безпечний спосіб: використовуємо вже розпарсений SDK об'єкт
+        if response.parsed:
+            # Перетворюємо об'єкти Pydantic у звичайні словники, як це було раніше
+            replies = [{"bot_id": r.bot_id, "text": r.text} for r in response.parsed.replies]
+            new_facts = response.parsed.new_facts
+            scene_goal_reached = response.parsed.scene_goal_reached
             
-        return replies, scene_goal_reached
-        
+            for fact in new_facts:
+                await save_fact(db, chat_id, fact)
+                print(f"[{chat_id}] МЕНТАЛЬНИЙ ЗАПИС: {fact}")
+                
+            return replies, scene_goal_reached
+        else:
+            return [], False
+            
     except Exception as e:
-        print(f"Помилка обробки JSON від ШІ: {e}")
+        print(f"Помилка обробки відмови ШІ: {e}")
         return [], False
 
 # 2. Оновлюємо функцію збереження (використовуємо INSERT OR IGNORE)
@@ -163,7 +167,7 @@ async def save_message(db: aiosqlite.Connection, chat_id: int, message_id: int, 
     await db.commit()
 
 
-@dp.message(Command(commands=["start_story", "start_story@tgTeller_bot "], ignore_mention=True))
+@dp.message(Command(commands=["start_story", "start_story@tgTeller_bot"], ignore_mention=True))
 async def handle_start(message: Message, bot: Bot):
     if bot.id != bot1.id:
         return
@@ -178,20 +182,24 @@ async def handle_start(message: Message, bot: Bot):
         "Ви — нова учениця в елітній закритій школі. Завтра ваш перший день. "
         "Раптом ваш телефон вібрує. Хтось анонімно додав вас у приватний чат...\n\n"
         "*(Системне повідомлення: Користувач '<span class=\"tg-spoiler\">ㅤㅤㅤㅤㅤㅤ</span>' додав вас до групи 'Еліта Юди')*"
-        )
+    )
     
     await teller.send_message(chat_id, intro_text, parse_mode="html")
     await asyncio.sleep(3)
     
-    # 2. Боти починають реагувати на появу новенької
-    kai_msg = await bot1.send_message(chat_id, "Гей, хтось щойно додав сюди новий контакт. Це та сама новенька, що перевелася до нас? Привіт, як звати?) 👋 Я Кай.")
-    await save_message(chat_id, kai_msg.message_id, f"bot_{bot1.id}", kai_msg.text)
-    await asyncio.sleep(3)
-    
-    dorian_msg = await bot2.send_message(chat_id, "Кай, ти як завжди радієш усім підряд. <span class=\"tg-spoiler\">ㅤㅤㅤㅤㅤㅤ</span> знову грає в свої ігри. Дівчино, хто б ти не була, краще вийди з цього чату, поки можеш.", parse_mode="html")
-    await save_message(chat_id, dorian_msg.message_id, f"bot_{bot2.id}", dorian_msg.text)
-    
-    await save_fact(chat_id, "Новенька в Академії, завтра перший день")
+    # ВІДКРИВАЄМО БАЗУ ДЛЯ ЗБЕРЕЖЕННЯ ПОВІДОМЛЕНЬ ПРИ СТАРТІ
+    async with aiosqlite.connect("chat_history.db") as db:
+        # 2. Боти починають реагувати на появу новенької
+        kai_msg = await bot1.send_message(chat_id, "Гей, хтось щойно додав сюди новий контакт. Це та сама новенька, що перевелася до нас? Привіт, як звати?) 👋 Я Кай.")
+        await save_message(db, chat_id, kai_msg.message_id, f"bot_{bot1.id}", kai_msg.text)
+        
+        await asyncio.sleep(3)
+        
+        dorian_msg = await bot2.send_message(chat_id, "Кай, ти як завжди радієш усім підряд. <span class=\"tg-spoiler\">ㅤㅤㅤㅤㅤㅤ</span> знову грає в свої ігри. Дівчино, хто б ти не була, краще вийди з цього чату, поки можеш.", parse_mode="html")
+        await save_message(db, chat_id, dorian_msg.message_id, f"bot_{bot2.id}", dorian_msg.text)
+        
+        await save_fact(db, chat_id, "Новенька в Академії, завтра перший день")
+
 
 @dp.message(Command("reset", ignore_mention=True))
 async def reset_game(message: Message):
@@ -249,7 +257,18 @@ async def handle_message(message: Message, bot: Bot):
                         sent_msg = await bot1.send_message(chat_id, ai_text)
                         await save_message(db, chat_id, sent_msg.message_id, f"bot_{bot1.id}", ai_text)
                         
-                    # ... [Аналогічно для bot2 та bot3 - передаємо db у save_message] ...
+                    # ПОВЕРТАЄМО ЛОГІКУ ДЛЯ ДОРІАНА (bot2) ТА ЛЮЦІАНА (bot3)
+                    elif str(bot2.id) in ai_sender:
+                        await bot2.send_chat_action(chat_id=chat_id, action="typing")
+                        await asyncio.sleep(typing_time)
+                        sent_msg = await bot2.send_message(chat_id, ai_text)
+                        await save_message(db, chat_id, sent_msg.message_id, f"bot_{bot2.id}", ai_text)
+                        
+                    elif str(bot3.id) in ai_sender:
+                        await bot3.send_chat_action(chat_id=chat_id, action="typing")
+                        await asyncio.sleep(typing_time)
+                        sent_msg = await bot3.send_message(chat_id, ai_text)
+                        await save_message(db, chat_id, sent_msg.message_id, f"bot_{bot3.id}", ai_text)
 
                 # === ПЕРЕВІРКА СЦЕНИ ===
                 if scene_goal_reached:
@@ -259,26 +278,26 @@ async def handle_message(message: Message, bot: Bot):
                     if next_stage in STORY_STAGES:
                         await asyncio.sleep(4)
                         intro_text = STORY_STAGES[current_stage]["next_scene_intro"]
-                        await bot1.send_message(chat_id, intro_text)
+                        await teller.send_message(chat_id, intro_text)
                         await advance_chat_stage(db, chat_id)
                         
                         # Пам'ятайте про унікальний від'ємний ID для системних повідомлень, як обговорювалось в попередньому пункті!
                         system_msg_id = int(time.time() * -1000)
                         await save_message(db, chat_id, system_msg_id, "system", intro_text) 
                         print(f"[{chat_id}] СЮЖЕТ ПЕРЕЙШОВ НА ГЛАВУ {next_stage}")
-                else:
-                    # СЮЖЕТ ЗАКІНЧИВСЯ!
-                    await asyncio.sleep(4)
-                    end_text = (
-                        "🎬 *КІНЕЦЬ ДЕМО-ВЕРСІЇ* 🎬\n\n"
-                        "Дякуємо, що зіграли в перший епізод 'Академії Святого Юди'. "
-                        "Попереду ще багато таємниць. Введіть /reset, щоб спробувати інші варіанти діалогів!"
-                    )
-                    await teller.send_message(chat_id, end_text)
-                    # Можна також заблокувати подальші відповіді ботів, але для демо вистачить і цього.
-        # else:
-        #     await teller.send_message(chat_id, "*(Зв'язок з Академією тимчасово перервано. Спробуйте ще раз.)*")
-        #     return
+                    else:
+                        # СЮЖЕТ ЗАКІНЧИВСЯ!
+                        await asyncio.sleep(4)
+                        end_text = (
+                            "🎬 *КІНЕЦЬ ДЕМО-ВЕРСІЇ* 🎬\n\n"
+                            "Дякуємо, що зіграли в перший епізод 'Академії Святого Юди'. "
+                            "Попереду ще багато таємниць. Введіть /reset, щоб спробувати інші варіанти діалогів!"
+                        )
+                        await teller.send_message(chat_id, end_text)
+                        # Можна також заблокувати подальші відповіді ботів, але для демо вистачить і цього.
+            else:
+                await teller.send_message(chat_id, "*(Зв'язок з Академією тимчасово перервано. Спробуйте ще раз.)*")
+                return
 
 async def main():
     await init_db()
